@@ -8,6 +8,36 @@ import { calculateOrderSize, getTradeMultiplier } from '../config/copyStrategy';
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
 
+// Track consecutive Cloudflare errors to implement circuit breaker
+let consecutiveCloudflareErrors = 0;
+const MAX_CONSECUTIVE_CLOUDFLARE_ERRORS = 3; // Reduced to 3 for faster pause
+let cloudflarePauseUntil = 0; // Timestamp when pause expires
+
+/**
+ * Check if bot is paused due to Cloudflare blocking
+ */
+export const isCloudflarePaused = (): boolean => {
+    return Date.now() < cloudflarePauseUntil;
+};
+
+/**
+ * Get remaining pause time in minutes
+ */
+export const getCloudflarePauseRemaining = (): number => {
+    if (!isCloudflarePaused()) return 0;
+    return Math.ceil((cloudflarePauseUntil - Date.now()) / 60000);
+};
+
+/**
+ * Pause bot due to Cloudflare blocking
+ */
+const pauseForCloudflare = (minutes: number = 30): void => {
+    cloudflarePauseUntil = Date.now() + (minutes * 60 * 1000);
+    Logger.error(`🚨 PAUSE MODE ACTIVATED: Bot paused for ${minutes} minutes due to Cloudflare blocking`);
+    Logger.error(`⏸️  Will resume at ${new Date(cloudflarePauseUntil).toLocaleTimeString()}`);
+    Logger.error(`💡 To resume earlier, restart the bot: npm start`);
+};
+
 // Legacy parameters (for backward compatibility in SELL logic)
 const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
 const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
@@ -55,12 +85,82 @@ const extractOrderError = (response: unknown): string | undefined => {
     return undefined;
 };
 
+const isCloudflareBlockError = (response: unknown): boolean => {
+    if (!response || typeof response !== 'object') {
+        return false;
+    }
+
+    const data = response as Record<string, unknown>;
+    
+    // Check for 403 status (primary indicator)
+    if (data.status === 403 || data.statusCode === 403) {
+        // Also check if response data contains HTML (Cloudflare block page)
+        const responseData = data.data;
+        if (typeof responseData === 'string') {
+            const lowerData = responseData.toLowerCase();
+            if (
+                lowerData.includes('<!doctype html') ||
+                lowerData.includes('cloudflare') ||
+                lowerData.includes('sorry, you have been blocked') ||
+                lowerData.includes('attention required')
+            ) {
+                return true;
+            }
+        }
+        return true; // 403 status alone is enough
+    }
+
+    // Check statusText for "Forbidden"
+    if (data.statusText === 'Forbidden') {
+        return true;
+    }
+
+    // Check error message for Cloudflare indicators
+    const errorMessage = extractOrderError(response);
+    if (errorMessage) {
+        const lower = errorMessage.toLowerCase();
+        if (
+            lower.includes('blocked') ||
+            lower.includes('cloudflare') ||
+            lower.includes('forbidden') ||
+            lower.includes('403') ||
+            lower.includes('<!doctype html') ||
+            lower.includes('sorry, you have been blocked')
+        ) {
+            return true;
+        }
+    }
+
+    // Check if response data is HTML (Cloudflare block page)
+    if (data.data && typeof data.data === 'string') {
+        const lowerData = (data.data as string).toLowerCase();
+        if (
+            lowerData.includes('<!doctype html') ||
+            lowerData.includes('cloudflare') ||
+            lowerData.includes('sorry, you have been blocked')
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
 const isInsufficientBalanceOrAllowanceError = (message: string | undefined): boolean => {
     if (!message) {
         return false;
     }
     const lower = message.toLowerCase();
     return lower.includes('not enough balance') || lower.includes('allowance');
+};
+
+/**
+ * Add a random delay with jitter to make request patterns less predictable
+ * Helps avoid Cloudflare detection
+ */
+const randomDelay = (baseMs: number, jitterMs: number = 0): Promise<void> => {
+    const delay = baseMs + (jitterMs > 0 ? Math.random() * jitterMs : 0);
+    return new Promise((resolve) => setTimeout(resolve, delay));
 };
 
 const postOrder = async (
@@ -74,6 +174,15 @@ const postOrder = async (
     userAddress: string
 ) => {
     const UserActivity = getUserActivityModel(userAddress);
+    
+    // Check if paused due to Cloudflare
+    if (isCloudflarePaused()) {
+        const remainingMinutes = Math.ceil((cloudflarePauseUntil - Date.now()) / 60000);
+        Logger.warning(`⏸️  Bot is paused due to Cloudflare blocking. Resuming in ${remainingMinutes} minute(s)...`);
+        Logger.warning(`💡 Restart the bot to resume immediately, or wait for auto-resume`);
+        await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+        return;
+    }
     //Merge strategy
     if (condition === 'merge') {
         Logger.info('Executing MERGE strategy...');
@@ -96,6 +205,11 @@ const postOrder = async (
         let retry = 0;
         let abortDueToFunds = false;
         while (remaining > 0 && retry < RETRY_LIMIT) {
+            // Delay before fetching order book to reduce request frequency
+            if (retry > 0) {
+                await randomDelay(1000, 500); // 1-1.5s delay on retries
+            }
+            
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.bids || orderBook.bids.length === 0) {
                 Logger.warning('No bids available in order book');
@@ -126,16 +240,61 @@ const postOrder = async (
             }
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
+            
+            // Delay between order book fetch and order posting (helps avoid Cloudflare) - RELAXED
+            await randomDelay(1000, 500); // 1-1.5s delay (relaxed from 5-10s)
+            
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
             if (resp.success === true) {
                 retry = 0;
+                consecutiveCloudflareErrors = 0; // Reset on success
                 Logger.orderResult(
                     true,
                     `Sold ${order_arges.amount} tokens at $${order_arges.price}`
                 );
                 remaining -= order_arges.amount;
+                // Small delay after successful order to space out requests
+                if (remaining > 0) {
+                    await randomDelay(1000, 500); // 1-1.5s delay before next order
+                }
             } else {
                 const errorMessage = extractOrderError(resp);
+                
+                // Check for Cloudflare blocking
+                if (isCloudflareBlockError(resp)) {
+                    consecutiveCloudflareErrors += 1;
+                    Logger.warning('⚠️  Cloudflare blocking detected (403 Forbidden)');
+                    
+                    // Circuit breaker: if too many consecutive Cloudflare errors, pause bot completely
+                    if (consecutiveCloudflareErrors >= MAX_CONSECUTIVE_CLOUDFLARE_ERRORS) {
+                        pauseForCloudflare(15); // Pause for 15 minutes (relaxed from 60)
+                        Logger.error('🚨 Your IP address has been blocked by Cloudflare');
+                        Logger.error('💡 Solutions:');
+                        Logger.error('   1. Wait 30 minutes and restart the bot');
+                        Logger.error('   2. Use a different network (mobile hotspot, VPN)');
+                        Logger.error('   3. Contact Polymarket support to whitelist your IP');
+                        await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                        return; // Stop trying to place orders
+                    }
+                    
+                    Logger.warning(`This usually resolves after a few minutes. Retry ${consecutiveCloudflareErrors}/${MAX_CONSECUTIVE_CLOUDFLARE_ERRORS}...`);
+                    
+                    // Exponential backoff for Cloudflare errors: 10s, 20s, 40s (RELAXED)
+                    const cloudflareDelay = Math.min(10000 * Math.pow(2, retry), 60000); // Up to 60 seconds
+                    Logger.info(`Waiting ${cloudflareDelay / 1000}s before retry...`);
+                    await randomDelay(cloudflareDelay, cloudflareDelay * 0.2); // Add 20% jitter
+                    
+                    retry += 1;
+                    if (retry >= RETRY_LIMIT) {
+                        Logger.error('Max retries reached for Cloudflare blocking. Marking trade as failed.');
+                        Logger.error('💡 Consider waiting 15-30 minutes before restarting the bot');
+                    }
+                    continue;
+                } else {
+                    // Reset counter on non-Cloudflare errors
+                    consecutiveCloudflareErrors = 0;
+                }
+                
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(
@@ -202,6 +361,11 @@ const postOrder = async (
         let totalBoughtTokens = 0; // Track total tokens bought for this trade
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
+            // Delay before fetching order book to reduce request frequency
+            if (retry > 0) {
+                await randomDelay(1000, 500); // 1-1.5s delay on retries
+            }
+            
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.asks || orderBook.asks.length === 0) {
                 Logger.warning('No asks available in order book');
@@ -247,9 +411,14 @@ const postOrder = async (
             );
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
+            
+            // Delay between order book fetch and order posting (helps avoid Cloudflare) - RELAXED
+            await randomDelay(1000, 500); // 1-1.5s delay (relaxed from 5-10s)
+            
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
             if (resp.success === true) {
                 retry = 0;
+                consecutiveCloudflareErrors = 0; // Reset on success
                 const tokensBought = order_arges.amount / order_arges.price;
                 totalBoughtTokens += tokensBought;
                 Logger.orderResult(
@@ -257,8 +426,48 @@ const postOrder = async (
                     `Bought $${order_arges.amount.toFixed(2)} at $${order_arges.price} (${tokensBought.toFixed(2)} tokens)`
                 );
                 remaining -= order_arges.amount;
+                // Small delay after successful order to space out requests
+                if (remaining > 0) {
+                    await randomDelay(1000, 500); // 1-1.5s delay before next order
+                }
             } else {
                 const errorMessage = extractOrderError(resp);
+                
+                // Check for Cloudflare blocking
+                if (isCloudflareBlockError(resp)) {
+                    consecutiveCloudflareErrors += 1;
+                    Logger.warning('⚠️  Cloudflare blocking detected (403 Forbidden)');
+                    
+                    // Circuit breaker: if too many consecutive Cloudflare errors, pause bot completely
+                    if (consecutiveCloudflareErrors >= MAX_CONSECUTIVE_CLOUDFLARE_ERRORS) {
+                        pauseForCloudflare(15); // Pause for 15 minutes (relaxed from 60)
+                        Logger.error('🚨 Your IP address has been blocked by Cloudflare');
+                        Logger.error('💡 Solutions:');
+                        Logger.error('   1. Wait 30 minutes and restart the bot');
+                        Logger.error('   2. Use a different network (mobile hotspot, VPN)');
+                        Logger.error('   3. Contact Polymarket support to whitelist your IP');
+                        await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                        return; // Stop trying to place orders
+                    }
+                    
+                    Logger.warning(`This usually resolves after a few minutes. Retry ${consecutiveCloudflareErrors}/${MAX_CONSECUTIVE_CLOUDFLARE_ERRORS}...`);
+                    
+                    // Exponential backoff for Cloudflare errors: 10s, 20s, 40s (RELAXED)
+                    const cloudflareDelay = Math.min(10000 * Math.pow(2, retry), 60000); // Up to 60 seconds
+                    Logger.info(`Waiting ${cloudflareDelay / 1000}s before retry...`);
+                    await randomDelay(cloudflareDelay, cloudflareDelay * 0.2); // Add 20% jitter
+                    
+                    retry += 1;
+                    if (retry >= RETRY_LIMIT) {
+                        Logger.error('Max retries reached for Cloudflare blocking. Marking trade as failed.');
+                        Logger.error('💡 Consider waiting 15-30 minutes before restarting the bot');
+                    }
+                    continue;
+                } else {
+                    // Reset counter on non-Cloudflare errors
+                    consecutiveCloudflareErrors = 0;
+                }
+                
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(
@@ -397,6 +606,11 @@ const postOrder = async (
         let totalSoldTokens = 0; // Track total tokens sold
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
+            // Delay before fetching order book to reduce request frequency
+            if (retry > 0) {
+                await randomDelay(1000, 500); // 1-1.5s delay on retries
+            }
+            
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.bids || orderBook.bids.length === 0) {
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -438,17 +652,62 @@ const postOrder = async (
             };
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
+            
+            // Delay between order book fetch and order posting (helps avoid Cloudflare) - RELAXED
+            await randomDelay(1000, 500); // 1-1.5s delay (relaxed from 5-10s)
+            
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
             if (resp.success === true) {
                 retry = 0;
+                consecutiveCloudflareErrors = 0; // Reset on success
                 totalSoldTokens += order_arges.amount;
                 Logger.orderResult(
                     true,
                     `Sold ${order_arges.amount} tokens at $${order_arges.price}`
                 );
                 remaining -= order_arges.amount;
+                // Small delay after successful order to space out requests
+                if (remaining > 0) {
+                    await randomDelay(1000, 500); // 1-1.5s delay before next order
+                }
             } else {
                 const errorMessage = extractOrderError(resp);
+                
+                // Check for Cloudflare blocking
+                if (isCloudflareBlockError(resp)) {
+                    consecutiveCloudflareErrors += 1;
+                    Logger.warning('⚠️  Cloudflare blocking detected (403 Forbidden)');
+                    
+                    // Circuit breaker: if too many consecutive Cloudflare errors, pause bot completely
+                    if (consecutiveCloudflareErrors >= MAX_CONSECUTIVE_CLOUDFLARE_ERRORS) {
+                        pauseForCloudflare(15); // Pause for 15 minutes (relaxed from 60)
+                        Logger.error('🚨 Your IP address has been blocked by Cloudflare');
+                        Logger.error('💡 Solutions:');
+                        Logger.error('   1. Wait 30 minutes and restart the bot');
+                        Logger.error('   2. Use a different network (mobile hotspot, VPN)');
+                        Logger.error('   3. Contact Polymarket support to whitelist your IP');
+                        await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                        return; // Stop trying to place orders
+                    }
+                    
+                    Logger.warning(`This usually resolves after a few minutes. Retry ${consecutiveCloudflareErrors}/${MAX_CONSECUTIVE_CLOUDFLARE_ERRORS}...`);
+                    
+                    // Exponential backoff for Cloudflare errors: 10s, 20s, 40s (RELAXED)
+                    const cloudflareDelay = Math.min(10000 * Math.pow(2, retry), 60000); // Up to 60 seconds
+                    Logger.info(`Waiting ${cloudflareDelay / 1000}s before retry...`);
+                    await randomDelay(cloudflareDelay, cloudflareDelay * 0.2); // Add 20% jitter
+                    
+                    retry += 1;
+                    if (retry >= RETRY_LIMIT) {
+                        Logger.error('Max retries reached for Cloudflare blocking. Marking trade as failed.');
+                        Logger.error('💡 Consider waiting 15-30 minutes before restarting the bot');
+                    }
+                    continue;
+                } else {
+                    // Reset counter on non-Cloudflare errors
+                    consecutiveCloudflareErrors = 0;
+                }
+                
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(

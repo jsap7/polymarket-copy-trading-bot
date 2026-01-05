@@ -322,6 +322,52 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
     return config;
 };
 
+/**
+ * Parse proxy configuration from environment
+ * Format: PROXY_LIST='host1:port1:user1:pass1:ip1,host2:port2:user2:pass2:ip2'
+ * Or: PROXY_LIST='host1:port1,host2:port2' (without auth)
+ */
+const parseProxies = (): Array<{ host: string; port: number; username?: string; password?: string; ip?: string }> => {
+    const proxyListStr = process.env.PROXY_LIST;
+    if (!proxyListStr) {
+        return [];
+    }
+
+    const proxies: Array<{ host: string; port: number; username?: string; password?: string; ip?: string }> = [];
+    const entries = proxyListStr.split(',').map((e) => e.trim()).filter((e) => e.length > 0);
+
+    for (const entry of entries) {
+        const parts = entry.split(':');
+        if (parts.length < 2) {
+            console.warn(`⚠️  Invalid proxy format: ${entry}. Skipping.`);
+            continue;
+        }
+
+        const proxy: { host: string; port: number; username?: string; password?: string; ip?: string } = {
+            host: parts[0],
+            port: parseInt(parts[1], 10),
+        };
+
+        if (isNaN(proxy.port)) {
+            console.warn(`⚠️  Invalid proxy port: ${parts[1]}. Skipping.`);
+            continue;
+        }
+
+        // Optional: username:password:ip
+        if (parts.length >= 4) {
+            proxy.username = parts[2];
+            proxy.password = parts[3];
+        }
+        if (parts.length >= 5) {
+            proxy.ip = parts[4];
+        }
+
+        proxies.push(proxy);
+    }
+
+    return proxies;
+};
+
 export const ENV = {
     USER_ADDRESSES: parseUserAddresses(process.env.USER_ADDRESSES as string),
     PROXY_WALLET: process.env.PROXY_WALLET as string,
@@ -348,4 +394,8 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    // Proxy configuration
+    PROXY_LIST: parseProxies(),
+    // Anti-Cloudflare settings
+    ENABLE_ANTI_CLOUDFLARE: process.env.ENABLE_ANTI_CLOUDFLARE !== 'false', // Default: true
 };

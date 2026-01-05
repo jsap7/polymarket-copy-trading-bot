@@ -4,7 +4,7 @@ import { ENV } from '../config/env';
 import { getUserActivityModel } from '../models/userHistory';
 import fetchData from '../utils/fetchData';
 import getMyBalance from '../utils/getMyBalance';
-import postOrder from '../utils/postOrder';
+import postOrder, { isCloudflarePaused, getCloudflarePauseRemaining } from '../utils/postOrder';
 import Logger from '../utils/logger';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
@@ -145,7 +145,8 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
 };
 
 const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
-    for (const trade of trades) {
+    for (let i = 0; i < trades.length; i++) {
+        const trade = trades[i];
         // Mark trade as being processed immediately to prevent duplicate processing
         const UserActivity = getUserActivityModel(trade.userAddress);
         await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
@@ -196,6 +197,12 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         );
 
         Logger.separator();
+        
+        // Add delay between processing multiple trades to reduce request rate
+        if (i < trades.length - 1) {
+            const delay = 2000 + Math.random() * 1000; // 2-3s delay between trades
+            await new Promise((resolve) => setTimeout(resolve, delay));
+        }
     }
 };
 
@@ -326,14 +333,23 @@ const tradeExecutor = async (clobClient: ClobClient) => {
             // Update waiting message
             if (trades.length === 0 && readyAggregations.length === 0) {
                 if (Date.now() - lastCheck > 300) {
-                    const bufferedCount = tradeAggregationBuffer.size;
-                    if (bufferedCount > 0) {
+                    // Check if paused due to Cloudflare
+                    if (isCloudflarePaused()) {
+                        const remaining = getCloudflarePauseRemaining();
                         Logger.waiting(
                             USER_ADDRESSES.length,
-                            `${bufferedCount} trade group(s) pending`
+                            `⏸️  PAUSED: Cloudflare blocking (${remaining} min remaining)`
                         );
                     } else {
-                        Logger.waiting(USER_ADDRESSES.length);
+                        const bufferedCount = tradeAggregationBuffer.size;
+                        if (bufferedCount > 0) {
+                            Logger.waiting(
+                                USER_ADDRESSES.length,
+                                `${bufferedCount} trade group(s) pending`
+                            );
+                        } else {
+                            Logger.waiting(USER_ADDRESSES.length);
+                        }
                     }
                     lastCheck = Date.now();
                 }
@@ -350,7 +366,16 @@ const tradeExecutor = async (clobClient: ClobClient) => {
             } else {
                 // Update waiting message every 300ms for smooth animation
                 if (Date.now() - lastCheck > 300) {
-                    Logger.waiting(USER_ADDRESSES.length);
+                    // Check if paused due to Cloudflare
+                    if (isCloudflarePaused()) {
+                        const remaining = getCloudflarePauseRemaining();
+                        Logger.waiting(
+                            USER_ADDRESSES.length,
+                            `⏸️  PAUSED: Cloudflare blocking (${remaining} min remaining)`
+                        );
+                    } else {
+                        Logger.waiting(USER_ADDRESSES.length);
+                    }
                     lastCheck = Date.now();
                 }
             }

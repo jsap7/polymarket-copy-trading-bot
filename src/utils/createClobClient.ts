@@ -3,6 +3,7 @@ import { ClobClient } from '@polymarket/clob-client';
 import { SignatureType } from '@polymarket/order-utils';
 import { ENV } from '../config/env';
 import Logger from './logger';
+import { delayAfterAuth } from './humanDelays';
 
 const PROXY_WALLET = ENV.PROXY_WALLET;
 const PRIVATE_KEY = ENV.PRIVATE_KEY;
@@ -56,6 +57,12 @@ const createClobClient = async (): Promise<ClobClient> => {
     let creds = await clobClient.createApiKey();
     if (!creds.key) {
         creds = await clobClient.deriveApiKey();
+    }
+
+    // Anti-Cloudflare: Longer delay after auth (20-40 seconds)
+    // Cloudflare sniffs hardest during authentication
+    if (ENV.ENABLE_ANTI_CLOUDFLARE) {
+        await delayAfterAuth();
     }
 
     clobClient = new ClobClient(

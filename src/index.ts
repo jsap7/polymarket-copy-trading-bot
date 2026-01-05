@@ -5,6 +5,7 @@ import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
+import { proxyManager } from './utils/proxyManager';
 import test from './test/test';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
@@ -77,6 +78,15 @@ export const main = async () => {
         
         await connectDB();
         Logger.startup(USER_ADDRESSES, PROXY_WALLET);
+
+        // Initialize proxy manager if proxies are configured
+        if (ENV.ENABLE_ANTI_CLOUDFLARE && ENV.PROXY_LIST.length > 0) {
+            Logger.info('Initializing proxy manager...');
+            proxyManager.initialize(ENV.PROXY_LIST);
+            Logger.success(`✅ Anti-Cloudflare mode enabled with ${ENV.PROXY_LIST.length} proxy(ies)`);
+        } else if (ENV.ENABLE_ANTI_CLOUDFLARE) {
+            Logger.info('⚠️  Anti-Cloudflare mode enabled but no proxies configured. Running with delays only.');
+        }
 
         // Perform initial health check
         Logger.info('Performing initial health check...');
